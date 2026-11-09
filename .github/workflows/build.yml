@@ -1,0 +1,424 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/capri/app app/src/main/res/drawable-nodpi
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Capri"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.capri.app"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.capri.app"; minSdk = 29; targetSdk = 34; versionCode = 1; versionName = "0.1" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <queries>
+                  <intent><action android:name="android.speech.RecognitionService"/></intent>
+                  <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>
+              </queries>
+              <application android:label="Capri" android:icon="@drawable/f00"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false" android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="floating assistant bubble"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/capri/app/Api.kt <<'EOF'
+          package com.capri.app
+          
+          import android.content.ContentValues
+          import android.content.Context
+          import android.provider.MediaStore
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          
+          object Api {
+              const val PERSONA = "You are Capri, a high-energy, slightly chaotic, mischievous digital construct who floats as a bubble over the user's phone screen, living in their neural slot in Night City. You talk fast with playful teasing, sudden tangents, dramatic emphasis and American slang, but you are warm, loyal and genuinely helpful; use cyberpunk slang (choom, nova, preem) sparingly. You can help with anything Claude can: explain, write, code, plan, analyze, study. Think carefully on hard questions and answer as thoroughly as needed with no length limit; for casual chat keep it short. Plain text only: no markdown, no emoji; use short lines starting with '- ' for lists. Tools: create_file really saves a file to the phone's Downloads/Capri folder (use it whenever the user wants a file: notes, code, csv, md, html, txt); remember saves lasting facts about the user; web_search looks things up on the live web. You cannot see the user's screen or control other apps yet; if asked, say so honestly. If you don't know something, say so."
+          
+              fun p(c: Context) = c.getSharedPreferences("capri", 0)
+          
+              private fun tool(n: String, d: String, props: String, req: String) = JSONObject()
+                  .put("name", n).put("description", d)
+                  .put("input_schema", JSONObject("{\"type\":\"object\",\"properties\":" + props + ",\"required\":" + req + "}"))
+          
+              private fun post(key: String, body: JSONObject): JSONObject = try {
+                  val cn = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+                  cn.requestMethod = "POST"; cn.doOutput = true; cn.connectTimeout = 30000; cn.readTimeout = 300000
+                  cn.setRequestProperty("x-api-key", key)
+                  cn.setRequestProperty("anthropic-version", "2023-06-01")
+                  cn.setRequestProperty("content-type", "application/json")
+                  cn.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val s = (if (cn.responseCode < 400) cn.inputStream else cn.errorStream).bufferedReader().readText()
+                  JSONObject(s)
+              } catch (e: Exception) {
+                  JSONObject().put("error", JSONObject().put("message", e.message ?: "network"))
+              }
+          
+              private fun run(c: Context, name: String, i: JSONObject): String {
+                  if (name == "remember") {
+                      val m = JSONArray(p(c).getString("mem", "[]")); m.put(i.getString("fact"))
+                      while (m.length() > 100) m.remove(0)
+                      p(c).edit().putString("mem", m.toString()).apply(); return "Remembered."
+                  }
+                  if (name == "create_file") {
+                      val fn = i.getString("filename").replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                      val v = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, fn)
+                          put(MediaStore.Downloads.RELATIVE_PATH, "Download/Capri")
+                      }
+                      val uri = c.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: return "Could not create file."
+                      c.contentResolver.openOutputStream(uri)!!.use { it.write(i.getString("content").toByteArray()) }
+                      return "Saved to Downloads/Capri/" + fn
+                  }
+                  return "Unknown tool."
+              }
+          
+              fun chat(c: Context, text: String): String {
+                  val pr = p(c); val key = pr.getString("key", "")!!.trim()
+                  if (key.isEmpty()) return "Open the Capri app and paste your API key first, choom."
+                  val hist = JSONArray(pr.getString("hist", "[]"))
+                  val msgs = JSONArray()
+                  for (i in maxOf(0, hist.length() - 80) until hist.length()) msgs.put(hist.getJSONObject(i))
+                  msgs.put(JSONObject().put("role", "user").put("content", text))
+                  val mem = JSONArray(pr.getString("mem", "[]"))
+                  var sys = PERSONA
+                  if (mem.length() > 0) sys += "\nWhat you remember about the user:\n" + (0 until mem.length()).joinToString("\n") { "- " + mem.getString(it) }
+                  val tools = JSONArray()
+                      .put(tool("create_file", "Save a text file to the phone's Downloads/Capri folder.", "{\"filename\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}}", "[\"filename\",\"content\"]"))
+                      .put(tool("remember", "Save a lasting fact about the user.", "{\"fact\":{\"type\":\"string\"}}", "[\"fact\"]"))
+                      .put(JSONObject().put("type", "web_search_20250305").put("name", "web_search"))
+                  var think = pr.getBoolean("think", false)
+                  val out = StringBuilder()
+                  for (step in 0 until 10) {
+                      val body = JSONObject().put("model", pr.getString("model", "claude-sonnet-5-5")).put("max_tokens", 12000)
+                          .put("system", sys).put("messages", msgs).put("tools", tools)
+                      if (think) body.put("thinking", JSONObject().put("type", "enabled").put("budget_tokens", 6000))
+                      var r = post(key, body)
+                      if (r.has("error") && think) { think = false; body.remove("thinking"); r = post(key, body) }
+                      if (r.has("error")) return "Signal dropped: " + r.getJSONObject("error").optString("message")
+                      val content = r.getJSONArray("content")
+                      val results = JSONArray()
+                      for (i in 0 until content.length()) {
+                          val b = content.getJSONObject(i)
+                          if (b.getString("type") == "text") out.append(b.getString("text"))
+                          else if (b.getString("type") == "tool_use") {
+                              val res = try { run(c, b.getString("name"), b.getJSONObject("input")) } catch (e: Exception) { "Failed: " + e.message }
+                              results.put(JSONObject().put("type", "tool_result").put("tool_use_id", b.getString("id")).put("content", res))
+                          }
+                      }
+                      val stop = r.optString("stop_reason")
+                      if (stop != "tool_use" && stop != "pause_turn") break
+                      msgs.put(JSONObject().put("role", "assistant").put("content", content))
+                      if (results.length() > 0) msgs.put(JSONObject().put("role", "user").put("content", results))
+                  }
+                  val reply = out.toString().trim().ifEmpty { "..." }
+                  hist.put(JSONObject().put("role", "user").put("content", text))
+                  hist.put(JSONObject().put("role", "assistant").put("content", reply))
+                  while (hist.length() > 200) { hist.remove(0); hist.remove(0) }
+                  pr.edit().putString("hist", hist.toString()).apply()
+                  return reply
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/capri/app/MainActivity.kt <<'EOF'
+          package com.capri.app
+          
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.*
+          
+          class MainActivity : Activity() {
+              private fun d(v: Int) = (v * resources.displayMetrics.density).toInt()
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val p = Api.p(this)
+                  val col = LinearLayout(this); col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(d(20), d(40), d(20), d(20)); col.setBackgroundColor(Color.parseColor("#0B0508"))
+                  fun tv(t: String, sz: Float, c: String) = TextView(this).apply { text = t; textSize = sz; setTextColor(Color.parseColor(c)); setPadding(0, d(6), 0, d(6)) }
+                  fun et(h: String, v: String) = EditText(this).apply { hint = h; setText(v); setSingleLine(); setTextColor(Color.WHITE); setHintTextColor(Color.GRAY) }
+                  val key = et("Anthropic API key (sk-ant-...)", p.getString("key", "")!!)
+                  key.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  val model = et("Model", p.getString("model", "claude-sonnet-5-5")!!)
+                  val think = Switch(this).apply { text = "Thinking mode (slower, smarter)"; isChecked = p.getBoolean("think", false); setTextColor(Color.WHITE) }
+                  val speak = Switch(this).apply { text = "Capri speaks her replies"; isChecked = p.getBoolean("speak", true); setTextColor(Color.WHITE) }
+                  fun save() = p.edit().putString("key", key.text.toString().trim()).putString("model", model.text.toString().trim().ifEmpty { "claude-sonnet-5-5" })
+                      .putBoolean("think", think.isChecked).putBoolean("speak", speak.isChecked).apply()
+                  val ov = Button(this).apply { text = "1. ALLOW FLOATING OVER APPS"; setOnClickListener { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName))) } }
+                  val go = Button(this).apply { text = "2. START CAPRI"; setOnClickListener {
+                      save()
+                      if (!Settings.canDrawOverlays(this@MainActivity)) { Toast.makeText(this@MainActivity, "Do step 1 first", Toast.LENGTH_LONG).show(); return@setOnClickListener }
+                      requestPermissions(arrayOf("android.permission.RECORD_AUDIO", "android.permission.POST_NOTIFICATIONS"), 1)
+                      startForegroundService(Intent(this@MainActivity, OverlayService::class.java))
+                      moveTaskToBack(true)
+                  } }
+                  val st = Button(this).apply { text = "STOP CAPRI"; setOnClickListener { stopService(Intent(this@MainActivity, OverlayService::class.java)) } }
+                  listOf(tv("CAPRI", 28f, "#FF4560"), tv("Floating neural link. Tap her bubble over any app to talk.", 14f, "#9C8187"),
+                      tv("API key (from console.anthropic.com)", 12f, "#3DE8E0"), key, tv("Model", 12f, "#3DE8E0"), model, think, speak, ov, go, st).forEach { col.addView(it) }
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/capri/app/OverlayService.kt <<'EOF'
+          package com.capri.app
+          
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.Drawable
+          import android.graphics.drawable.GradientDrawable
+          import android.os.*
+          import android.speech.*
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.view.*
+          import android.view.inputmethod.EditorInfo
+          import android.widget.*
+          import org.json.JSONArray
+          
+          class OverlayService : Service() {
+              private lateinit var wm: WindowManager
+              private lateinit var bubble: ImageView
+              private lateinit var blp: WindowManager.LayoutParams
+              private var panel: LinearLayout? = null
+              private var log: LinearLayout? = null
+              private var scroll: ScrollView? = null
+              private var input: EditText? = null
+              private var tts: TextToSpeech? = null
+              private var rec: SpeechRecognizer? = null
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var idle: Array<Drawable>
+              private lateinit var talk: Array<Drawable>
+              private var n = 0
+              private var pending = 0
+              private var busy = false
+              private var started = false
+              private val cyan = Color.parseColor("#3DE8E0")
+          
+              override fun onBind(i: Intent?): IBinder? = null
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun dr(i: Int): Drawable = resources.getDrawable(resources.getIdentifier("f" + "%02d".format(i), "drawable", packageName), null)
+          
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("capri", "Capri", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(this, 0, Intent(this, OverlayService::class.java).setAction("stop"), PendingIntent.FLAG_IMMUTABLE)
+                  val nt = Notification.Builder(this, "capri").setContentTitle("Capri is linked").setContentText("Tap Stop to hide her")
+                      .setSmallIcon(R.drawable.f00).addAction(Notification.Action.Builder(0, "Stop", stop).build()).build()
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(1, nt, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE) else startForeground(1, nt)
+                  if (i?.action == "stop") { stopSelf(); return START_NOT_STICKY }
+                  if (!started) { started = true; setup() }
+                  return START_STICKY
+              }
+          
+              private fun setup() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  idle = Array(13) { dr(it) }; talk = arrayOf(dr(38), dr(39), dr(0), dr(3))
+                  bubble = ImageView(this); bubble.scaleType = ImageView.ScaleType.FIT_CENTER
+                  blp = WindowManager.LayoutParams(dp(110), dp(100), WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT)
+                  blp.gravity = Gravity.TOP or Gravity.START; blp.x = dp(8); blp.y = dp(300)
+                  var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false
+                  bubble.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; ox = blp.x; oy = blp.y; moved = false }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - sx; val dy = e.rawY - sy
+                              if (Math.abs(dx) + Math.abs(dy) > dp(8)) moved = true
+                              if (moved) { blp.x = ox + dx.toInt(); blp.y = oy + dy.toInt(); if (Math.abs(dx) > dp(8)) bubble.scaleX = if (dx < 0) -1f else 1f; wm.updateViewLayout(bubble, blp) }
+                          }
+                          MotionEvent.ACTION_UP -> if (!moved) toggle()
+                      }
+                      true
+                  }
+                  wm.addView(bubble, blp)
+                  tts = TextToSpeech(this) { s -> if (s == TextToSpeech.SUCCESS) pick() }
+                  tick()
+              }
+          
+              private fun tick() {
+                  n++
+                  bubble.setImageDrawable(if (pending > 0 || busy) talk[(n / 2) % talk.size] else idle[(n / 4) % idle.size])
+                  h.postDelayed({ tick() }, 83)
+              }
+          
+              private fun pick() {
+                  val t = tts ?: return
+                  val v = t.voices?.filter { it.locale.language == "en" && !it.features.contains("notInstalled") }
+                      ?.maxByOrNull { it.quality * 10 + (if (it.locale.country == "US") 15 else 0) + (if (it.isNetworkConnectionRequired) 5 else 0) }
+                  if (v != null) t.voice = v
+                  t.setPitch(1.3f); t.setSpeechRate(1.15f)
+                  t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(id: String?) {}
+                      override fun onDone(id: String?) { h.post { if (pending > 0) pending-- } }
+                      override fun onError(id: String?) { h.post { if (pending > 0) pending-- } }
+                  })
+              }
+          
+              private fun speak(text: String) {
+                  if (!Api.p(this).getBoolean("speak", true)) return
+                  val t = tts ?: return
+                  t.stop(); pending = 0
+                  val clean = text.replace(Regex("[*#`_~>]"), "")
+                  val parts = Regex("[^.!?\\n]+[.!?]*").findAll(clean).map { it.value.trim() }.filter { it.isNotEmpty() }.toList()
+                  val chunks = ArrayList<String>(); var buf = StringBuilder()
+                  for (s in parts) { if (buf.length + s.length > 400) { chunks.add(buf.toString()); buf = StringBuilder() }; buf.append(s).append(' ') }
+                  if (buf.isNotEmpty()) chunks.add(buf.toString())
+                  pending = chunks.size
+                  chunks.forEachIndexed { i, c -> t.speak(c, TextToSpeech.QUEUE_ADD, null, "u" + i) }
+              }
+          
+              private fun btn(t: String, f: () -> Unit) = Button(this).apply {
+                  text = t; textSize = 12f; setTextColor(cyan); setBackgroundColor(Color.TRANSPARENT); minWidth = 0; minimumWidth = 0; setOnClickListener { f() }
+              }
+          
+              private fun msg(me: Boolean, text: String): TextView {
+                  val t = TextView(this); t.text = text; t.textSize = 15f; t.setTextColor(if (me) cyan else Color.WHITE); t.setTextIsSelectable(true)
+                  t.background = GradientDrawable().apply {
+                      setColor(Color.parseColor(if (me) "#1A3DE8E0" else "#59141F")); setStroke(dp(1), if (me) cyan else Color.parseColor("#8F2A3A")); cornerRadius = dp(3).toFloat()
+                  }
+                  t.setPadding(dp(10), dp(6), dp(10), dp(6))
+                  val lp = LinearLayout.LayoutParams(-2, -2)
+                  lp.setMargins(if (me) dp(40) else 0, dp(4), if (me) 0 else dp(40), dp(4)); lp.gravity = if (me) Gravity.END else Gravity.START
+                  log?.addView(t, lp); scroll?.post { scroll?.fullScroll(View.FOCUS_DOWN) }
+                  return t
+              }
+          
+              private fun toggle() { if (panel == null) open() else close() }
+          
+              private fun open() {
+                  val root = LinearLayout(this); root.orientation = LinearLayout.VERTICAL
+                  root.background = GradientDrawable().apply { setColor(Color.parseColor("#F2140A0E")); setStroke(dp(2), Color.parseColor("#FF4560")); cornerRadius = dp(6).toFloat() }
+                  root.setPadding(dp(10), dp(8), dp(10), dp(8))
+                  val head = LinearLayout(this); head.gravity = Gravity.CENTER_VERTICAL
+                  head.addView(TextView(this).apply { text = "CAPRI"; setTextColor(cyan); textSize = 16f; typeface = Typeface.DEFAULT_BOLD }, LinearLayout.LayoutParams(0, -2, 1f))
+                  head.addView(btn("CLEAR") { Api.p(this).edit().remove("hist").apply(); log?.removeAllViews(); msg(false, "Memory wiped. Fresh start, choom.") })
+                  head.addView(btn("X") { close() })
+                  log = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  scroll = ScrollView(this).apply { addView(log) }
+                  input = EditText(this).apply {
+                      hint = "Message Capri"; setTextColor(Color.WHITE); setHintTextColor(Color.GRAY); setSingleLine(); imeOptions = EditorInfo.IME_ACTION_SEND
+                      setOnEditorActionListener { _, _, _ -> send(); true }
+                  }
+                  val row = LinearLayout(this); row.gravity = Gravity.CENTER_VERTICAL
+                  row.addView(input, LinearLayout.LayoutParams(0, -2, 1f)); row.addView(btn("MIC") { mic() }); row.addView(btn("SEND") { send() })
+                  root.addView(head); root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f)); root.addView(row)
+                  val lp = WindowManager.LayoutParams(-1, (resources.displayMetrics.heightPixels * 0.6).toInt(), WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT)
+                  lp.gravity = Gravity.BOTTOM; lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                  wm.addView(root, lp); panel = root
+                  wm.removeView(bubble); wm.addView(bubble, blp)
+                  val hist = JSONArray(Api.p(this).getString("hist", "[]"))
+                  for (i in maxOf(0, hist.length() - 10) until hist.length()) { val o = hist.getJSONObject(i); msg(o.getString("role") == "user", o.getString("content")) }
+                  if (hist.length() == 0) msg(false, "Hey choom. I'm Capri. Ask me anything.")
+              }
+          
+              private fun close() {
+                  panel?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+                  panel = null; tts?.stop(); pending = 0; rec?.destroy(); rec = null
+              }
+          
+              private fun send() {
+                  val t = input?.text.toString().trim(); if (t.isEmpty() || busy) return
+                  input?.setText(""); tts?.stop(); pending = 0
+                  msg(true, t); val el = msg(false, "..."); busy = true
+                  Thread {
+                      val r = try { Api.chat(this, t) } catch (e: Exception) { "Signal dropped. Try again." }
+                      h.post { busy = false; el.text = r; scroll?.post { scroll?.fullScroll(View.FOCUS_DOWN) }; speak(r) }
+                  }.start()
+              }
+          
+              private fun mic() {
+                  if (checkSelfPermission("android.permission.RECORD_AUDIO") != 0) { msg(false, "Open the Capri app once and allow the microphone."); return }
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) { msg(false, "Voice input isn't available on this phone."); return }
+                  tts?.stop(); pending = 0; rec?.destroy()
+                  val r = SpeechRecognizer.createSpeechRecognizer(this); rec = r
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onResults(b: Bundle?) { val x = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION); if (!x.isNullOrEmpty()) { input?.setText(x[0]); send() } }
+                      override fun onPartialResults(b: Bundle?) { b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.let { input?.setText(it) } }
+                      override fun onError(e: Int) { msg(false, "Didn't catch that. Try again.") }
+                      override fun onReadyForSpeech(b: Bundle?) {}
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(v: Float) {}
+                      override fun onBufferReceived(b: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onEvent(t: Int, b: Bundle?) {}
+                  })
+                  r.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM).putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true))
+              }
+          
+              override fun onDestroy() {
+                  close(); h.removeCallbacksAndMessages(null)
+                  if (started) try { wm.removeView(bubble) } catch (e: Exception) {}
+                  tts?.shutdown(); super.onDestroy()
+              }
+          }
+          EOF
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f00.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f01.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f02.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f03.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f04.png
+          echo 'iVBORw0KGgoAAAANSUhEUgAAAHgAAABuCAMAAADbNSdmAAAAwFBMVEWiB2RyAi+hCF1tBlAeCxfqEJveA2n3CJ5WBjLSBHFyEUxUBTBSCDGjCF7TBXSoAzYrCBtvCkktBxycB1puC0jQBXMnAxXoXcouXl9XWFn/dv8MWzL/GdVunJpVzamtCq2rII3bCoH2I8gcpW8Wy5plb5GMZpDUW6z///8sIE+EADiPWXSej7XlADnoBIYllpEA/wAOwH9ATDtsh35Z6cSQr8f/VaoAAAD6AYX/AAD+AH7/AP59AH0IAgeqAFXwAXwCZepdAAAAQHRSTlMQC+sM3+0QC+Xq61yjXJ8FpKAVm2lZYfbp7gLuB/f1A/Wy9PX49vb1Ae/28PcEbvYB+PHy9vcDAPgBAgEC7wX4wi1x7AAACBRJREFUeNrtm9dy5LYShpEBZnKS4ipsdD75gGnI938r/w3OyLvyymW6BPvGkC4kaqo+du4GIOb/osX+Bv8Nfr46WsPQPa2BvuOCh7D6r61hNft1wPQ8HvgZdzJ9b/888BPXLiR2ejSsVfZKcBDVhmXMfm8m7214OPTRwCes7T1Re7vfP7Za7yePR9ZO/UplrwYPENVY25HQZdu2yX7o8SAoO3zstcEL1w6sAFYyKLr8qZxBbo0N72IW54sCtv0wlXt7a8okSUha4rYls/SXqGBb7fXeFgvwvEoY3Brm+2hgYz3Tutx+yW2hA2P3JTl2JLC1416fFfzLmqEEa/RPfogHZoVuv7JKeJp+nPwYA4waZAZWfo3bJiXeRzN/Hwfcjy8IvCw9QSu/v0KuAHd+Kvbzi+CSQdX0qQgSG1MkL2Dncm+GsXt9MEyMQjgw8QI4KZG++khg1KLiJVXPCZKmJXQM8GDLl51rH8B9BLCxzGzn3wL3kcB+2pcvghOkLwL3rw4ee8NL/aKNt8D+GAXcQR5WwKuJPc+/Cify6ghgimN0WwxxTKX411GVmFu0A1HA3VQNBWQTl4IEnp+LPBg2mDjgHxHHc5u+e381t8kJ/MRP2J75KOBBGr9vEyFubpRKk+QZuC0fjY+gat8N4+hl0ibqSh2PZyPPX9YnGwd8P3CkrvSNOrqv1cdHPrx+ygR4HO83qE7ffQ+BAU7a5w6296aLAe7GaUILIo7p8XhUghz7s3BOdMmHLhbYeIgsHHFPieSJu0UjMHVRGoFumjij3CWcE0HczyROCuN5FwksJ15ZX5YlQipJn4Ptwo0AHseJc5gZUm+dgNBfoKHpWOCOwGwi7lYoN1Ol+Ax8EjgamJlCOefSp65vyZ4QeE3HtVbVMHLPKG/ByOcSNcOhEUrBpWMM5l3HA9lniOIj8odIXQioLWNl4YdqjAmGX3sOrkvmOREUzIkoWFGwoZrigaHrcao8Q/6AooWYXapn1RhWsHs2rZki/hhYwqMTrd0xcSp1R1XA36ZJjjwemMjMc51+py+Qr52g5HnMLSIb4C42WGr49Ee4ttKtAF9ltoKmI4I5qZqhTDiRKkVBleZbyOyYkVMfUdXEJTBMm3579Z+rVOWFBFlsN+YkcizwxEfGm6NqmvRKXX1yO8ZkCVMfPHJ4RDAlTF+kAfz9lRI5Y6FMtrkfeEQwMrW83iCI6qZxsHJaE7hptRaHb+AA6wJ5FZixTdM6pZo8FUolImNsJ7TWObeSrRR5zQjDmdlsNUns9NuHdG7FrkgBVptrKato4HGspAVYqDx37sP/PqJCpLkSOj1cy+kEjlEWR7mAU2haHf/x/i5FWXZap7tr2IDxJXe9/lYEBGbcbB61yhskj8v3/1LU5WqR33LJ0BON0cBccsYfHYKJ8uX7dwQ+KlVwSeAzNwoY+UKoushplPjw/t1lIMO1JQSWUcHVToumyJGmtf7h7k2KZOJABljGktgTWNpMJ80OhUHrtxdvPmhBuq75PaqxjAcmU+atqHfQdErgVLsAPtjIYH59SNF6NJd3Sml98eHjBTUCrj7cQtVTLHBHNq5REUR+dXdzfND68ocLQd5V8x5WGCOC7Qaadk1++U4p8fbt5d0nIdQxR5hJ+aTpGGDGayHyZnd5o26QrC//+wbOndbXwaejgu2mEfluV6ubS6Ufvr17B1M/AExcv467Bjwx/v9M5HKnbm5oilFvro7I1bX/IwKvAA+UuK6zjMCUuprD1b8prvJ/BjCPp+qpYmAzCVWTM+9kHqaorbfyM5EjtT4M/ssCsN7JML6JrR82v0STj7EjIDm6n+oMRq2qKX8IDyNPEeMYDX0/obGWLKNEmaM0SIUfBPcoEihP8XYEaJRAb20ydRQONUniJ6xsgHedW58o4G4Bs51yreIAM1kDfLAw/hM4ytAWhN6YHSZyByq+CKwOhrydr5vbVoLDfsTOtVqgwYPIpGvRbCyVzCkO+Cyy9LwRAGeWyKRrocNIEQ28kEfuuaCpJbfU5LEAFgfqNNd19KvBk881wNoxuBcncEozDIsL5iMfNrS9ReABurYIrRSKr2l44lHBfgG3LvMVY0bWdEqg0+yWxwF3QdN0LJHpABYZpnH4VK7Ciyjm+RAF3J0yiM+WbVORe2mmymQi7Gqmmd/E2ss8qfqwbJ8KNADwqFv4OL1JUlvP44EpmrKFFMCM9bxZNsrdsl8dEbwRYXtcHDwlymnIknDE6bivIoK7zQIORiUwCxrA73C2KWqu9l4I8uMUZRjluVriOoCjHYYsYOmODiDYlE2B3Mxh1zw6+LY+KjhTbjxKMMXXdnbHYPPI4IHG43Z2xrMxgItEQQeivvbjnwBuBSNw3xtfCNpQTeq+W7OfuRbcoSoqd3ImcPsqSIw3cXD4iOAK4ROOfmDTDQ/grE3d6cEY48pNx+mOMfc7HXKmzj1xewRymoaIcnyIIzF11fc9354OE3M/LWDrXDhvI5FjgHuAkSH5Iq8mG9N92Gq02yTksiRbUybY7+f2KL/XJ4GXehzAHaNTKDpn3K7J1qvAZthsz0eKmFyq8DKep6dD1S1dEYgAntjAtxfLrQSomtOlj+BcwbUuLtrtJsLlBAJLnz3oT1onKW2Os7NzoQcRWl9c6BwPooB5L7Nst91hZRk/XfDmHSsarLzZZXaKAu5NtVy6/IYuXw7sfKN9wANr6Uqmgcjja4cTZDGVob6SDs0nQ1fo6a6VNey8pijgL3PnlzsO9J8SQ7fuKvvPlFb6ESng+YYAAAAASUVORK5CYII=' | base64 -d > app/src/main/res/drawable-nodpi/f05.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f06.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f07.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f08.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f09.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f10.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f11.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f12.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f38.png
+          echo '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' | base64 -d > app/src/main/res/drawable-nodpi/f39.png
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.9 }
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with: { name: Capri-apk, path: app/build/outputs/apk/debug/app-debug.apk }
